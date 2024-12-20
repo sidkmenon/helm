@@ -59,6 +59,12 @@ import (
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 )
 
+var FieldManagersToAdopt = []string{
+	"kubectl",
+	"kubectl-client-side-apply",
+	"kubectl-edit",
+}
+
 // ErrNoObjectsVisited indicates that during a visit operation, no matching objects were found.
 var ErrNoObjectsVisited = errors.New("no objects visited")
 
@@ -665,6 +671,53 @@ func createPatch(target *resource.Info, current runtime.Object) ([]byte, types.P
 
 	patch, err := strategicpatch.CreateThreeWayMergePatch(oldData, newData, currentData, patchMeta, true)
 	return patch, types.StrategicMergePatchType, err
+}
+
+// applyResource runs SSA via helm.
+func (c *Client) applyResource(target *resource.Info, force bool) error {
+	helper := resource.NewHelper(target.Client, target.Mapping).
+		WithFieldManager(getManagedFieldsManager())
+	// Send the full object to be applied on the server side.
+	data, err := runtime.Encode(unstructured.UnstructuredJSONScheme, target.Object)
+	if err != nil {
+		return errors.Wrap(err, "failed to encode target object")
+	}
+	obj, err := helper.Patch(target.Namespace, target.Name, types.ApplyPatchType, data, &metav1.PatchOptions{
+		Force: &force,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "cannot patch %q with kind %s", target.Name, target.Mapping.GroupVersionKind.Kind)
+	}
+	target.Refresh(obj, true)
+
+	// afterwards, we will reconcile managed fields on these objects and re-apply if necessary.
+	// the reason we do this is to avoid 3 network requests in the "happy/normal" case with SSA.
+	// we want to first (1) apply, (2) try to check if a migration is needed, and (3) run the migration if we must.
+	// now, we will try to migrate managed fields of the object, if necessary.
+	didMigrate, err := migrateManagedFields(
+		helper,
+		target,
+		FieldManagersToAdopt,
+		getManagedFieldsManager(),
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to upgrade managed fields for helm ssa migration")
+	} else if !didMigrate {
+		// in the average case, there's no work to do - the object is already up to date.
+		return nil
+	}
+
+	c.Log("Applied patch to reconcile server-side-apply managed fields, re-applying SSA for object %s of kind %s in namespace %s", target.Name, target.Mapping.GroupVersionKind.Kind, target.Namespace)
+	// now we know that there were some extra managed fields lying around. Re-send original SSA to the api-server
+	// to clear the old managed fields.
+	obj, err = helper.Patch(target.Namespace, target.Name, types.ApplyPatchType, data, &metav1.PatchOptions{
+		Force: &force,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "cannot patch %q with kind %s", target.Name, target.Mapping.GroupVersionKind.Kind)
+	}
+	target.Refresh(obj, true)
+	return nil
 }
 
 func updateResource(c *Client, target *resource.Info, currentObj runtime.Object, force bool) error {
