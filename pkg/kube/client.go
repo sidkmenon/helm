@@ -92,6 +92,82 @@ type Client struct {
 	kubeClient *kubernetes.Clientset
 }
 
+// Apply implements InterfaceWithSSA.
+func (c *Client) Apply(original ResourceList, target ResourceList, forceConflicts bool) (*Result, error) {
+	updateErrors := []string{}
+	res := &Result{}
+
+	c.Log("Checking %d resources for changes", len(target))
+	err := target.Visit(func(info *resource.Info, err error) error {
+		if err != nil {
+			return err
+		}
+
+		helper := resource.NewHelper(info.Client, info.Mapping).WithFieldManager(getManagedFieldsManager())
+		if _, err := helper.Get(info.Namespace, info.Name); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return errors.Wrap(err, "could not get information about the resource")
+			}
+
+			// Append the created resource to the results, even if something fails
+			res.Created = append(res.Created, info)
+
+			kind := info.Mapping.GroupVersionKind.Kind
+			c.Log("Creating a new %s called %q in %s\n", kind, info.Name, info.Namespace)
+		} else {
+			kind := info.Mapping.GroupVersionKind.Kind
+			originalInfo := original.Get(info)
+			if originalInfo == nil {
+				return errors.Errorf("no %s with the name %q found", kind, info.Name)
+			}
+			c.Log("Updating %s %q in %s\n", kind, info.Name, info.Namespace)
+			// Because we check for errors later, append the info regardless
+			res.Updated = append(res.Updated, info)
+		}
+
+		if err := c.applyResource(info, forceConflicts); err != nil {
+			c.Log("error updating the resource %q:\n\t %v", info.Name, err)
+			updateErrors = append(updateErrors, err.Error())
+		}
+
+		return nil
+	})
+
+	switch {
+	case err != nil:
+		return res, err
+	case len(updateErrors) != 0:
+		return res, errors.New(strings.Join(updateErrors, " && "))
+	}
+
+	// creation case - nothing to clean up.
+	if len(original) == 0 {
+		return res, nil
+	}
+	for _, info := range original.Difference(target) {
+		c.Log("Deleting %s %q in namespace %s...", info.Mapping.GroupVersionKind.Kind, info.Name, info.Namespace)
+
+		if err := info.Get(); err != nil {
+			c.Log("Unable to get obj %q, err: %s", info.Name, err)
+			continue
+		}
+		annotations, err := metadataAccessor.Annotations(info.Object)
+		if err != nil {
+			c.Log("Unable to get annotations on %q, err: %s", info.Name, err)
+		}
+		if annotations != nil && annotations[ResourcePolicyAnno] == KeepPolicy {
+			c.Log("Skipping delete of %q due to annotation [%s=%s]", info.Name, ResourcePolicyAnno, KeepPolicy)
+			continue
+		}
+		if err := deleteResource(info, metav1.DeletePropagationBackground); err != nil {
+			c.Log("Failed to delete %q, err: %s", info.ObjectName(), err)
+			continue
+		}
+		res.Deleted = append(res.Deleted, info)
+	}
+	return res, nil
+}
+
 func init() {
 	// Add CRDs to the scheme. They are missing by default.
 	if err := apiextv1.AddToScheme(scheme.Scheme); err != nil {

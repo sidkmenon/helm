@@ -110,7 +110,15 @@ type InterfaceResources interface {
 	BuildTable(reader io.Reader, validate bool) (ResourceList, error)
 }
 
+// InterfaceWithSSA is introduced to avoid breaking backwards compatibility for Interface implementers.
+//
+// TODO: Helm 4: Remove InterfaceWithSSA and integrate its method(s) into the Interface.
+type InterfaceWithSSA interface {
+	Apply(original, target ResourceList, force bool) (*Result, error)
+}
+
 var _ Interface = (*Client)(nil)
 var _ InterfaceExt = (*Client)(nil)
 var _ InterfaceDeletionPropagation = (*Client)(nil)
 var _ InterfaceResources = (*Client)(nil)
+var _ InterfaceWithSSA = (*Client)(nil)
