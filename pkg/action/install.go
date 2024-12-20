@@ -113,6 +113,8 @@ type Install struct {
 	// TakeOwnership will ignore the check for helm annotations and take ownership of the resources.
 	TakeOwnership bool
 	PostRenderer  postrender.PostRenderer
+	// ServerSideApply runs server-side apply instead of strategic merge patch when applying objects.
+	ServerSideApply bool
 	// Lock to control raceconditions when the process receives a SIGTERM
 	Lock sync.Mutex
 }
@@ -452,7 +454,10 @@ func (i *Install) performInstall(rel *release.Release, toBeAdopted kube.Resource
 	// At this point, we can do the install. Note that before we were detecting whether to
 	// do an update, but it's not clear whether we WANT to do an update if the reuse is set
 	// to true, since that is basically an upgrade operation.
-	if len(toBeAdopted) == 0 && len(resources) > 0 {
+	if ssa, ok := i.cfg.KubeClient.(kube.InterfaceWithSSA); ok && i.ServerSideApply {
+		i.cfg.Log("Using server-side apply for %s", rel.Name)
+		_, err = ssa.Apply(toBeAdopted, resources, i.Force)
+	} else if len(toBeAdopted) == 0 && len(resources) > 0 {
 		_, err = i.cfg.KubeClient.Create(resources)
 	} else if len(resources) > 0 {
 		_, err = i.cfg.KubeClient.Update(toBeAdopted, resources, i.Force)
